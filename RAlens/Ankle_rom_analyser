@@ -1,0 +1,1049 @@
+"""
+Ankle Joint ROM Analysis — Rheumatoid Arthritis Detection
+MediaPipe Pose | AAOS / AMA Guides 6th Edition
+
+FULLY AUTOMATIC FLOW — no button needed:
+  Patient sits on chair, side-profile to camera.
+  LEFT  foot → Neutral → Dorsiflexion → Plantarflexion → 10s report
+              → AUTO-START RIGHT foot
+  RIGHT foot → Neutral → Dorsiflexion → Plantarflexion → 10s report
+              → window closes, combined JSON + TXT saved
+
+CAMERA POSITION:
+  Patient sits on chair with foot free (not touching floor).
+  Side-profile — ankle and foot clearly visible.
+  Left test : left side to camera.
+  Right test: right side to camera (turn chair around).
+
+ANKLE ANGLE METHOD:
+  Neutral = 90° (foot perpendicular to shin) → measured as 0° deviation
+  Dorsiflexion  = toes UP toward shin        → positive degrees (normal 20°)
+  Plantarflexion= toes DOWN / pointed        → negative degrees (normal -50°)
+  We store absolute values for reporting.
+
+MEDICAL REFERENCE — AAOS / AMA Guides 6th Ed.:
+  Dorsiflexion  : 0° → 20°   flag < 10°
+  Plantarflexion: 0° → 50°   flag < 30°
+
+Author: Ankle ROM Analysis System | 2025
+"""
+
+import cv2
+import mediapipe as mp
+import numpy as np
+import time
+import json
+import os
+from dataclasses import dataclass, asdict
+from typing import List, Tuple, Optional
+from enum import Enum
+from collections import deque
+from datetime import datetime
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CONFIGURATION
+# ═══════════════════════════════════════════════════════════════
+
+WINDOW_W, WINDOW_H = 960, 600
+
+class TestState(Enum):
+    WAITING            = 0
+    NEUTRAL_BASELINE   = 1
+    DORSIFLEXION_TEST  = 2   # toes UP toward shin
+    PLANTAR_TEST       = 3   # toes DOWN / pointed
+    COMPLETE           = 4
+
+# ── AAOS / AMA 6th Ed. thresholds ──────────────────────────
+THRESH = {
+    # Dorsiflexion (toes up)
+    'dorsi_normal':    20,    # full normal
+    'dorsi_flag':      10,    # mild restriction if < 10°
+    'dorsi_severe':     5,    # severe if < 5°
+
+    # Plantarflexion (toes down)
+    'plantar_normal':  50,    # full normal
+    'plantar_flag':    30,    # mild restriction if < 30°
+    'plantar_severe':  15,    # severe if < 15°
+
+    # Neutral window
+    'neutral_min':     80,    # foot angle 80-100° = neutral (90° ideal)
+    'neutral_max':    100,
+}
+
+# ── Stability settings ──────────────────────────────────────
+STAB = {
+    'buf':         18,
+    'variance':    8.0,
+    'hold_sec':    2.0,
+    'plateau_win': 22,
+    'plateau_tol': 2.5,
+}
+
+REPORT_SECS    = 10
+INTER_FOOT_SEC =  3
+
+# BGR colours
+CG  = (  0, 220,   0)
+CR  = (  0,   0, 210)
+CO  = (  0, 155, 255)
+CY  = (  0, 205, 255)
+CC  = (255, 215,   0)
+CW  = (235, 235, 235)
+CLB = (255, 195,  95)
+CDK = ( 16,  16,  26)
+CGR = (100, 100, 100)
+CPP = (200,  80, 200)   # purple for plantarflexion
+
+
+# ═══════════════════════════════════════════════════════════════
+#  DATA CLASS
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class AnkleResult:
+    side:                str
+    neutral_angle:       float   # foot-shin angle at rest (ideally ~90°)
+    max_dorsiflexion:    float   # degrees above neutral (toes up)
+    max_plantarflexion:  float   # degrees below neutral (toes down)
+    dorsi_grade:         str
+    plantar_grade:       str
+    dorsi_deficit:       float
+    plantar_deficit:     float
+    total_arc:           float   # dorsi + plantar
+    impairment_pct:      float
+    timestamp:           str
+    abnormalities:       List[str]
+    clinical_notes:      List[str]
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CAMERA SELECTION
+# ═══════════════════════════════════════════════════════════════
+
+def select_camera():
+    print("\n" + "─" * 50)
+    print("  CAMERA SELECTION")
+    print("─" * 50)
+    print("  1.  Built-in Webcam")
+    print("  2.  DroidCam  (WiFi)")
+    print("─" * 50)
+    while True:
+        c = input("  Enter 1 or 2: ").strip()
+        if c == '1':
+            return 0
+        if c == '2':
+            ip   = input("  DroidCam IP  (default 192.168.100.48): ").strip() or "192.168.100.48"
+            port = input("  Port         (default 4747): ").strip() or "4747"
+            return f"http://{ip}:{port}/video"
+        print("  Please enter 1 or 2")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  GEOMETRY — Ankle angle
+# ═══════════════════════════════════════════════════════════════
+
+def ankle_angle_raw(knee, ankle, foot_index) -> float:
+    """
+    Returns the angle at the ankle joint (knee-ankle-foot).
+    90° = foot perfectly perpendicular to shin (neutral)
+    < 90° = dorsiflexion (toes up, shin and foot angle narrows)
+    > 90° = plantarflexion (toes pointed, angle opens past 90)
+
+    We use the foot_index landmark (toe tip) as the foot vector endpoint.
+    """
+    v1 = knee       - ankle
+    v2 = foot_index - ankle
+    n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+    if n1 < 1e-6 or n2 < 1e-6:
+        return 90.0
+    cos_a = np.clip(np.dot(v1 / n1, v2 / n2), -1.0, 1.0)
+    return np.degrees(np.arccos(cos_a))
+
+
+def deviation_from_neutral(raw_angle: float, neutral: float) -> float:
+    """
+    Returns signed deviation from neutral:
+    positive = dorsiflexion (foot angle < neutral → toes up)
+    negative = plantarflexion (foot angle > neutral → toes pointed)
+    """
+    return neutral - raw_angle
+
+
+# ═══════════════════════════════════════════════════════════════
+#  LANDMARK HELPER
+# ═══════════════════════════════════════════════════════════════
+
+def get_foot(pose_lm, side: str):
+    """
+    Returns knee, ankle, foot_index numpy arrays.
+    For side-profile testing: patient's tested side faces camera.
+    Camera is flipped so MediaPipe side matches patient's visible side.
+    """
+    P = mp.solutions.pose.PoseLandmark
+    if side == 'left':
+        ki  = P.LEFT_KNEE.value
+        ai  = P.LEFT_ANKLE.value
+        fi  = P.LEFT_FOOT_INDEX.value
+        hi  = P.LEFT_HIP.value
+    else:
+        ki  = P.RIGHT_KNEE.value
+        ai  = P.RIGHT_ANKLE.value
+        fi  = P.RIGHT_FOOT_INDEX.value
+        hi  = P.RIGHT_HIP.value
+
+    lm  = pose_lm.landmark
+    kp  = np.array([lm[ki].x, lm[ki].y, lm[ki].z])
+    ap  = np.array([lm[ai].x, lm[ai].y, lm[ai].z])
+    fp  = np.array([lm[fi].x, lm[fi].y, lm[fi].z])
+    hp  = np.array([lm[hi].x, lm[hi].y, lm[hi].z])
+    vis = min(lm[ki].visibility, lm[ai].visibility, lm[fi].visibility)
+    return kp, ap, fp, hp, vis, ki, ai, fi
+
+
+# ═══════════════════════════════════════════════════════════════
+#  POSTURE VALIDATION + DIRECTIONAL GUIDANCE
+# ═══════════════════════════════════════════════════════════════
+
+def validate(raw_angle: float, neutral: float,
+             state: TestState) -> Tuple[bool, str, str]:
+    """
+    Returns (ok, status_message, direction_hint).
+    raw_angle = knee-ankle-foot angle in degrees.
+    neutral   = baseline angle captured at start.
+    deviation = neutral - raw_angle
+                positive → dorsiflexion
+                negative → plantarflexion
+    """
+    if state == TestState.NEUTRAL_BASELINE:
+        # Foot should be roughly 90° (perpendicular to shin)
+        if THRESH['neutral_min'] <= raw_angle <= THRESH['neutral_max']:
+            return True,  f"Good neutral position  ({raw_angle:.0f}°)", ""
+        elif raw_angle < THRESH['neutral_min']:
+            diff = THRESH['neutral_min'] - raw_angle
+            return False, f"Foot too dorsiflexed  ({raw_angle:.0f}°  need 80-100°)", \
+                          f"  Relax foot — let it hang naturally"
+        else:
+            diff = raw_angle - THRESH['neutral_max']
+            return False, f"Foot too plantarflexed  ({raw_angle:.0f}°  need 80-100°)", \
+                          f"  Bring toes up slightly — relax foot"
+
+    dev = deviation_from_neutral(raw_angle, neutral)
+
+    if state == TestState.DORSIFLEXION_TEST:
+        # Want deviation to be positive and large (toes up)
+        if dev >= THRESH['dorsi_flag']:
+            return True,  f"Good dorsiflexion  ({dev:.0f}° up)", ""
+        elif dev >= 5:
+            return True,  f"Keep pulling toes up  ({dev:.0f}°)", \
+                          f"  Pull toes further toward shin"
+        else:
+            return False, f"Pull toes UP toward shin  ({dev:.0f}°  need > 5°)", \
+                          f"  Flex foot upward — bring toes toward knee"
+
+    elif state == TestState.PLANTAR_TEST:
+        # Want deviation to be negative and large (toes down / pointed)
+        plantar_val = -dev   # make positive for display
+        if plantar_val >= THRESH['plantar_flag']:
+            return True,  f"Good plantarflexion  ({plantar_val:.0f}° down)", ""
+        elif plantar_val >= 15:
+            return True,  f"Keep pointing toes  ({plantar_val:.0f}°)", \
+                          f"  Point foot further down like ballet"
+        else:
+            return False, f"Point toes DOWN  ({plantar_val:.0f}°  need > 15°)", \
+                          f"  Push foot down — point toes toward floor"
+
+    return True, "Position OK", ""
+
+
+# ═══════════════════════════════════════════════════════════════
+#  MEDICAL GRADING
+# ═══════════════════════════════════════════════════════════════
+
+def grade_dorsiflexion(angle_deg: float) -> Tuple[str, float, str]:
+    """angle_deg = deviation above neutral (positive = toes up)"""
+    deficit = max(0.0, THRESH['dorsi_normal'] - angle_deg)
+    if angle_deg >= THRESH['dorsi_flag']:
+        return "NORMAL",   deficit, "Dorsiflexion within AAOS normal limits."
+    elif angle_deg >= THRESH['dorsi_severe']:
+        return "MILD",     deficit, f"Mild dorsiflexion restriction — {deficit:.0f}° below normal."
+    else:
+        return "SEVERE",   deficit, f"Severe dorsiflexion restriction — {deficit:.0f}° deficit. Urgent evaluation."
+
+
+def grade_plantarflexion(angle_deg: float) -> Tuple[str, float, str]:
+    """angle_deg = deviation below neutral (positive = toes down)"""
+    deficit = max(0.0, THRESH['plantar_normal'] - angle_deg)
+    if angle_deg >= THRESH['plantar_flag']:
+        return "NORMAL",   deficit, "Plantarflexion within AAOS normal limits."
+    elif angle_deg >= THRESH['plantar_severe']:
+        return "MILD",     deficit, f"Mild plantarflexion restriction — {deficit:.0f}° below normal."
+    else:
+        return "SEVERE",   deficit, f"Severe plantarflexion restriction — {deficit:.0f}° deficit."
+
+
+def estimate_impairment(total_arc: float) -> float:
+    """AMA Guides 6th Ed. — max ankle lower-extremity contribution ~7%."""
+    full_arc = 70.0   # 20° dorsi + 50° plantar
+    return round(max(0.0, (1.0 - min(total_arc / full_arc, 1.0)) * 7.0), 1)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ANNOTATED IMAGE CAPTURE
+# ═══════════════════════════════════════════════════════════════
+
+def annotated_capture(frame, pose_lm, side, raw_angle, dev,
+                      state, w, h) -> np.ndarray:
+    img = frame.copy()
+    P   = mp.solutions.pose.PoseLandmark
+    if side == 'left':
+        ki, ai, fi = P.LEFT_KNEE.value, P.LEFT_ANKLE.value, P.LEFT_FOOT_INDEX.value
+    else:
+        ki, ai, fi = P.RIGHT_KNEE.value, P.RIGHT_ANKLE.value, P.RIGHT_FOOT_INDEX.value
+
+    lm = pose_lm.landmark
+    kp = (int(lm[ki].x * w), int(lm[ki].y * h))
+    ap = (int(lm[ai].x * w), int(lm[ai].y * h))
+    fp = (int(lm[fi].x * w), int(lm[fi].y * h))
+
+    # Skeleton lines
+    cv2.line(img, kp, ap, (0, 200, 0),   3, cv2.LINE_AA)
+    cv2.line(img, ap, fp, (255, 160, 0), 3, cv2.LINE_AA)
+
+    # Joint circles + coord labels
+    for pt, col, name in [(kp, (0,220,220), "Knee"),
+                           (ap, (0,255,0),  "Ankle"),
+                           (fp, (255,180,0),"FootTip")]:
+        cv2.circle(img, pt, 10, (0,0,0), -1, cv2.LINE_AA)
+        cv2.circle(img, pt,  7, col,     -1, cv2.LINE_AA)
+        cv2.putText(img, f"{name} ({pt[0]},{pt[1]})",
+                    (pt[0]+12, pt[1]+5), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42, col, 1, cv2.LINE_AA)
+
+    # Angle annotation at ankle
+    direction = "UP" if dev >= 0 else "DOWN"
+    cv2.putText(img, f"Raw: {raw_angle:.1f} deg  Dev: {abs(dev):.1f} deg {direction}",
+                (ap[0]+10, ap[1]-18), cv2.FONT_HERSHEY_DUPLEX,
+                0.65, (0,255,255), 1, cv2.LINE_AA)
+
+    # Angle arc at ankle
+    arc_deg = int(min(abs(dev), 60))
+    if arc_deg > 2:
+        cv2.ellipse(img, ap, (50,50), 0, -90, -90 + arc_deg,
+                    (0,255,255), 2, cv2.LINE_AA)
+
+    # Header bar
+    cv2.rectangle(img, (0,0), (w,52), (0,0,0), -1)
+    ts = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
+    cv2.putText(img, f"{side.upper()} Ankle — {state.name}  |  raw {raw_angle:.1f}°  dev {dev:+.1f}°",
+                (10, 20), cv2.FONT_HERSHEY_DUPLEX, 0.50, (0,220,220), 1)
+    cv2.putText(img, ts, (10, 44),
+                cv2.FONT_HERSHEY_DUPLEX, 0.42, (155,155,155), 1)
+
+    # Landmark table bottom-right
+    rows = [
+        f"Knee    x={lm[ki].x:.3f}  y={lm[ki].y:.3f}  z={lm[ki].z:.3f}",
+        f"Ankle   x={lm[ai].x:.3f}  y={lm[ai].y:.3f}  z={lm[ai].z:.3f}",
+        f"FootTip x={lm[fi].x:.3f}  y={lm[fi].y:.3f}  z={lm[fi].z:.3f}",
+    ]
+    by = h - 10 - len(rows) * 20
+    cv2.rectangle(img, (w-384, by-8), (w-2, h-2), (20,20,20), -1)
+    for i, row in enumerate(rows):
+        cv2.putText(img, row, (w-380, by + i*20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (175,175,175), 1)
+    return img
+
+
+# ═══════════════════════════════════════════════════════════════
+#  GUI HELPERS
+# ═══════════════════════════════════════════════════════════════
+
+def rrect(img, x1, y1, x2, y2, r, color, alpha=0.78):
+    ov = img.copy()
+    cv2.rectangle(ov, (x1+r, y1), (x2-r, y2), color, -1)
+    cv2.rectangle(ov, (x1, y1+r), (x2, y2-r), color, -1)
+    for cx, cy in [(x1+r,y1+r),(x2-r,y1+r),(x1+r,y2-r),(x2-r,y2-r)]:
+        cv2.circle(ov, (cx,cy), r, color, -1)
+    cv2.addWeighted(ov, alpha, img, 1-alpha, 0, img)
+
+
+def t(img, text, x, y, sc=0.55, col=CW, th=1, bold=False):
+    f = cv2.FONT_HERSHEY_DUPLEX
+    if bold:
+        cv2.putText(img, text, (x, y), f, sc, (0,0,0), th+2)
+    cv2.putText(img, text, (x, y), f, sc, col, th)
+
+
+def draw_ankle_gauge(img, cx, cy, rad, dorsi_val, plantar_val):
+    """
+    Arc gauge:
+    Top half  = dorsiflexion  (toes up,   green)
+    Bottom half = plantarflexion (toes down, purple)
+    """
+    # Background arcs
+    cv2.ellipse(img, (cx,cy), (rad,rad), -90, 0,   70, (50,50,50), 8, cv2.LINE_AA)  # dorsi range
+    cv2.ellipse(img, (cx,cy), (rad,rad), -90, -70,  0, (50,50,50), 8, cv2.LINE_AA)  # plantar range
+
+    # Filled arcs
+    if dorsi_val > 1:
+        dv = int(min(dorsi_val / THRESH['dorsi_normal'] * 70, 70))
+        cv2.ellipse(img, (cx,cy), (rad,rad), -90, 0, dv, CG, 8, cv2.LINE_AA)
+
+    if plantar_val > 1:
+        pv = int(min(plantar_val / THRESH['plantar_normal'] * 70, 70))
+        cv2.ellipse(img, (cx,cy), (rad,rad), -90, -pv, 0, CPP, 8, cv2.LINE_AA)
+
+    # Center dot
+    cv2.circle(img, (cx, cy), 6, CW, -1, cv2.LINE_AA)
+
+
+def draw_skeleton_live(frame, pose_lm, side, w, h):
+    P = mp.solutions.pose.PoseLandmark
+    if side == 'left':
+        ki, ai, fi = P.LEFT_KNEE.value, P.LEFT_ANKLE.value, P.LEFT_FOOT_INDEX.value
+    else:
+        ki, ai, fi = P.RIGHT_KNEE.value, P.RIGHT_ANKLE.value, P.RIGHT_FOOT_INDEX.value
+    lm = pose_lm.landmark
+    kp = (int(lm[ki].x*w), int(lm[ki].y*h))
+    ap = (int(lm[ai].x*w), int(lm[ai].y*h))
+    fp = (int(lm[fi].x*w), int(lm[fi].y*h))
+    # glow
+    cv2.line(frame, kp, ap, (0,70,0),   10, cv2.LINE_AA)
+    cv2.line(frame, ap, fp, (100,50,0),  9, cv2.LINE_AA)
+    cv2.line(frame, kp, ap, CG,  4, cv2.LINE_AA)
+    cv2.line(frame, ap, fp, CO,  3, cv2.LINE_AA)
+    for pt, col, r in [(kp,CY,9),(ap,CC,13),(fp,CO,9)]:
+        cv2.circle(frame, pt, r+3, (0,0,0), -1, cv2.LINE_AA)
+        cv2.circle(frame, pt, r,   col,     -1, cv2.LINE_AA)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  LIVE UI
+# ═══════════════════════════════════════════════════════════════
+
+def draw_live(frame, pose_lm, raw_angle, dev, state, side,
+              ok, msg, hint, max_dorsi, max_plantar,
+              countdown, stable, w, h):
+
+    draw_skeleton_live(frame, pose_lm, side, w, h)
+
+    # Angle label at ankle
+    P  = mp.solutions.pose.PoseLandmark
+    ai = P.LEFT_ANKLE.value if side=='left' else P.RIGHT_ANKLE.value
+    lm = pose_lm.landmark
+    ap = (int(lm[ai].x*w), int(lm[ai].y*h))
+    dev_label = f"{abs(dev):.0f}° {'↑' if dev>=0 else '↓'}"
+    t(frame, dev_label, ap[0]+14, ap[1]-14, 0.80, CY, 2, bold=True)
+
+    # TOP BAR
+    rrect(frame, 0, 0, w, 70, 0, (14,14,24), alpha=0.90)
+    steps = {
+        TestState.NEUTRAL_BASELINE:  ("STEP 1 / 3", "Hold foot RELAXED — perpendicular to shin (neutral)"),
+        TestState.DORSIFLEXION_TEST: ("STEP 2 / 3", "Pull toes UP toward shin — dorsiflexion"),
+        TestState.PLANTAR_TEST:      ("STEP 3 / 3", "Point toes DOWN as far as possible — plantarflexion"),
+    }
+    sl, si_ = steps.get(state, ("", ""))
+    t(frame, sl,  14, 26, 0.52, CC, 1)
+    t(frame, si_, 14, 56, 0.60, CW, 1)
+
+    # Side badge
+    bc = (155, 48, 0) if side == 'left' else (0, 68, 155)
+    rrect(frame, w-132, 6, w-6, 64, 6, bc, alpha=0.92)
+    t(frame, f"{side.upper()} FOOT", w-124, 44, 0.64, CW, 2)
+
+    # Camera hint
+    rrect(frame, w-310, 70, w-6, 108, 4, (30,30,50), alpha=0.85)
+    t(frame, "Side-profile  |  Foot free (not on floor)", w-300, 96, 0.42, (180,180,180), 1)
+
+    # ANKLE GAUGE (bottom-right)
+    gcx, gcy = w-92, h-118
+    draw_ankle_gauge(frame, gcx, gcy, 65, max_dorsi, max_plantar)
+    t(frame, f"D:{max_dorsi:.0f}°", gcx-40, gcy+28, 0.42, CG,  1)
+    t(frame, f"P:{max_plantar:.0f}°", gcx-40, gcy+48, 0.42, CPP, 1)
+    t(frame, "ANKLE", gcx-28, gcy+64, 0.40, CW, 1)
+
+    # POSTURE FEEDBACK
+    fy = h - 108
+    rrect(frame, 8, fy, 535, h-8, 8,
+          (0,52,0) if ok else (52,0,0), alpha=0.80)
+    t(frame, msg,  18, fy+30, 0.58, CG if ok else CR, 2)
+    if hint:
+        t(frame, hint, 18, fy+58, 0.50, CO, 1)
+
+    # PROGRESS BARS
+    rrect(frame, 8, 82, 222, 235, 8, (18,18,32), alpha=0.80)
+    t(frame, "PROGRESS", 18, 106, 0.48, CC, 1)
+    bw = 194
+
+    # Dorsiflexion bar
+    t(frame, f"Dorsiflexion: {max_dorsi:.0f}°", 18, 134, 0.44, CW, 1)
+    dp_frac = min(max_dorsi / THRESH['dorsi_normal'], 1.0)
+    cv2.rectangle(frame, (18,142), (18+bw,154), (45,45,45), -1)
+    cv2.rectangle(frame, (18,142), (18+int(bw*dp_frac),154),
+                  CG if max_dorsi >= THRESH['dorsi_flag'] else CO, -1)
+
+    # Plantarflexion bar
+    t(frame, f"Plantarflex:  {max_plantar:.0f}°", 18, 178, 0.44, CW, 1)
+    pp_frac = min(max_plantar / THRESH['plantar_normal'], 1.0)
+    cv2.rectangle(frame, (18,186), (18+bw,198), (45,45,45), -1)
+    cv2.rectangle(frame, (18,186), (18+int(bw*pp_frac),198),
+                  CG if max_plantar >= THRESH['plantar_flag'] else CPP, -1)
+
+    # COUNTDOWN
+    if countdown is not None and countdown > 0:
+        rrect(frame, w//2-110, h//2-50, w//2+110, h//2+50, 14,
+              (0, 90, 0), alpha=0.92)
+        t(frame, "Capturing...", w//2-88, h//2-10, 0.72, CG, 2, bold=True)
+        t(frame, f"{countdown:.1f}s", w//2-38, h//2+32, 0.80, CY, 2, bold=True)
+    elif stable and ok:
+        t(frame, "STABLE", w-165, 110, 0.52, CG, 2)
+    else:
+        t(frame, "Stabilising...", w-210, 110, 0.46, CO, 1)
+
+    return frame
+
+
+# ═══════════════════════════════════════════════════════════════
+#  TRANSITION SCREEN
+# ═══════════════════════════════════════════════════════════════
+
+def draw_transition(cap, seconds=INTER_FOOT_SEC):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        ret, raw = cap.read()
+        frame = cv2.resize(cv2.flip(raw, 1) if ret else
+                           np.zeros((WINDOW_H, WINDOW_W, 3), np.uint8),
+                           (WINDOW_W, WINDOW_H))
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0,0), (WINDOW_W, WINDOW_H), (0,0,0), -1)
+        cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+
+        secs_left = deadline - time.time()
+        t(frame, "LEFT FOOT COMPLETE",
+          WINDOW_W//2 - 168, WINDOW_H//2 - 55, 0.88, CG, 2, bold=True)
+        t(frame, f"Starting RIGHT foot in  {secs_left:.0f}s ...",
+          WINDOW_W//2 - 222, WINDOW_H//2 + 10, 0.72, CC, 2)
+        t(frame, "Turn around — RIGHT side to camera",
+          WINDOW_W//2 - 195, WINDOW_H//2 + 55, 0.58, CW, 1)
+
+        bw = WINDOW_W - 40
+        bf = int(bw * (secs_left / seconds))
+        cv2.rectangle(frame, (20, WINDOW_H-14), (20+bw, WINDOW_H-4), (45,45,45), -1)
+        cv2.rectangle(frame, (20, WINDOW_H-14), (20+bf,  WINDOW_H-4), CC, -1)
+
+        cv2.imshow("Ankle ROM Analyzer", frame)
+        if (cv2.waitKey(40) & 0xFF) == ord('q'):
+            return False
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════
+#  REPORT SCREEN
+# ═══════════════════════════════════════════════════════════════
+
+def draw_report_screen(result: AnkleResult, secs_left: float):
+    img = np.zeros((WINDOW_H, WINDOW_W, 3), dtype=np.uint8)
+    img[:] = CDK
+
+    # Header
+    rrect(img, 0, 0, WINDOW_W, 56, 0, (26,26,44), alpha=1.0)
+    t(img, "ANKLE ROM REPORT", WINDOW_W//2-132, 38, 0.92, CC, 2, bold=True)
+    t(img, f"Auto-close in  {secs_left:.0f}s",
+      WINDOW_W-205, 38, 0.46, (120,120,120), 1)
+    cv2.line(img, (26,60), (WINDOW_W-26,60), (52,52,72), 1)
+
+    # Side badge
+    sc = (155,48,0) if result.side == 'left' else (0,68,155)
+    rrect(img, 26, 68, 200, 108, 6, sc, alpha=0.92)
+    t(img, f"{result.side.upper()} ANKLE", 38, 96, 0.64, CW, 2)
+    t(img, result.timestamp, WINDOW_W-340, 92, 0.40, (120,120,120), 1)
+
+    y = 116
+    cv2.line(img, (26,y), (WINDOW_W-26,y), (36,36,52), 1)
+    y += 16
+
+    # Measurements
+    t(img, "MEASUREMENTS  (AAOS / AMA 6th Ed.)", 32, y+14, 0.55, CC, 1)
+    y += 34
+
+    grade_colors = {
+        "NORMAL":   (CG,   (22,38,22)),
+        "MILD":     (CO,   (42,28,10)),
+        "MODERATE": (CR,   (44,18,18)),
+        "SEVERE":   ((0,0,180), (55,10,10)),
+    }
+
+    def mrow(label, val_str, ref_str, grade, yy):
+        gc, bg = grade_colors.get(grade, (CW, (25,25,40)))
+        rrect(img, 30, yy-20, WINDOW_W-30, yy+12, 4, bg, alpha=0.90)
+        t(img, label,            36,           yy, 0.49, CW,  1)
+        t(img, val_str,         316,           yy, 0.58, CY,  2)
+        t(img, ref_str,         388,           yy, 0.40, CGR, 1)
+        t(img, grade, WINDOW_W-122, yy, 0.52, gc, 2)
+
+    arc_ok  = result.total_arc >= 50
+    imp_ok  = result.impairment_pct < 1.5
+
+    mrow("Dorsiflexion   (toes UP toward shin)",
+         f"{result.max_dorsiflexion:.0f}°",
+         f"normal >= {THRESH['dorsi_normal']}°",
+         result.dorsi_grade, y);   y += 38
+
+    mrow("Plantarflexion  (toes DOWN / pointed)",
+         f"{result.max_plantarflexion:.0f}°",
+         f"normal >= {THRESH['plantar_normal']}°",
+         result.plantar_grade, y); y += 38
+
+    mrow("Total Arc of Motion  (dorsi + plantar)",
+         f"{result.total_arc:.0f}°",
+         "normal >= 50°",
+         "NORMAL" if arc_ok else "MODERATE", y); y += 38
+
+    mrow("AMA LE Impairment Estimate",
+         f"{result.impairment_pct:.1f}%",
+         "normal < 1.5% LE",
+         "NORMAL" if imp_ok else ("MILD" if result.impairment_pct < 4 else "MODERATE"),
+         y); y += 44
+
+    cv2.line(img, (26,y), (WINDOW_W-26,y), (36,36,52), 1)
+    y += 14
+
+    # Clinical summary
+    t(img, "CLINICAL SUMMARY", 32, y+14, 0.55, CC, 1)
+    y += 32
+    notes = result.clinical_notes
+    bg2 = (18,42,18) if not result.abnormalities else (44,18,18)
+    rrect(img, 30, y-2, WINDOW_W-30, y+len(notes)*28+10, 6, bg2, alpha=0.88)
+    nc = CG if not result.abnormalities else CO
+    for n in notes:
+        t(img, f"  {n}", 40, y+20, 0.47, nc, 1)
+        y += 28
+    y += 16
+    cv2.line(img, (26,y), (WINDOW_W-26,y), (36,36,52), 1)
+    y += 14
+
+    # Recommendations
+    t(img, "RECOMMENDATIONS", 32, y+14, 0.55, CC, 1)
+    y += 32
+    if not result.abnormalities:
+        recs = ["Continue current treatment and exercise plan.",
+                "Routine ankle ROM monitoring every 3 months."]
+        rc = CG
+    elif result.dorsi_grade == "SEVERE" or result.plantar_grade == "SEVERE":
+        recs = ["URGENT: Refer to rheumatologist / orthopaedic specialist.",
+                "Physiotherapy: ankle mobilisation and stretching.",
+                "Dorsiflexion stretches (towel stretch): 4x daily.",
+                "Consider ankle foot orthosis (AFO) if severe."]
+        rc = CR
+    else:
+        recs = ["Clinical evaluation recommended for ankle restriction.",
+                "Physiotherapy: ankle stretching 3x daily, 10 reps.",
+                "Calf stretches and towel pulls to improve ROM.",
+                "Reassess in 6 weeks and track progression."]
+        rc = CO
+    for r in recs:
+        t(img, f"  {r}", 40, y+18, 0.46, rc, 1)
+        y += 26
+
+    # Timer bar
+    bw2 = WINDOW_W - 40
+    bf2 = int(bw2 * (secs_left / REPORT_SECS))
+    cv2.rectangle(img, (20, WINDOW_H-10), (20+bw2, WINDOW_H-3), (42,42,42), -1)
+    cv2.rectangle(img, (20, WINDOW_H-10), (20+bf2,  WINDOW_H-3), CC,         -1)
+    return img
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CLINICAL ANALYSIS
+# ═══════════════════════════════════════════════════════════════
+
+def analyze(neutral, max_dorsi, max_plantar, side) -> AnkleResult:
+    dg, dd, dn = grade_dorsiflexion(max_dorsi)
+    pg, pd, pn = grade_plantarflexion(max_plantar)
+    total_arc  = max_dorsi + max_plantar
+    impairment = estimate_impairment(total_arc)
+
+    abn, notes = [], []
+    if dg != "NORMAL":
+        abn.append(f"Reduced dorsiflexion: {max_dorsi:.0f}° [{dg}] — {dn}")
+    if pg != "NORMAL":
+        abn.append(f"Reduced plantarflexion: {max_plantar:.0f}° [{pg}] — {pn}")
+    notes.append(dn)
+    notes.append(pn)
+    if not abn:
+        notes.append(f"Total arc {total_arc:.0f}° — full ankle ROM maintained.")
+
+    return AnkleResult(
+        side=side, neutral_angle=neutral,
+        max_dorsiflexion=max_dorsi, max_plantarflexion=max_plantar,
+        dorsi_grade=dg, plantar_grade=pg,
+        dorsi_deficit=dd, plantar_deficit=pd,
+        total_arc=total_arc, impairment_pct=impairment,
+        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        abnormalities=abn, clinical_notes=notes
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+#  REPORT SAVING
+# ═══════════════════════════════════════════════════════════════
+
+def save_report(folder, pid, left_r: Optional[AnkleResult],
+                right_r: Optional[AnkleResult]):
+    os.makedirs(folder, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # JSON
+    bilateral = None
+    if left_r and right_r:
+        dd = abs(left_r.max_dorsiflexion   - right_r.max_dorsiflexion)
+        dp = abs(left_r.max_plantarflexion - right_r.max_plantarflexion)
+        bilateral = {
+            "dorsiflexion_difference_deg":   round(dd, 1),
+            "plantarflexion_difference_deg": round(dp, 1),
+            "asymmetry_flag":                dd > 10 or dp > 15,
+            "clinical_note": "Difference >10° dorsi or >15° plantar is clinically significant."
+        }
+
+    jp = os.path.join(folder, f"{pid}_ankle_report.json")
+    with open(jp, 'w') as f:
+        json.dump({
+            "patient_id":   pid,
+            "test_date":    ts,
+            "standard":     "AAOS / AMA Guides 6th Edition — Ankle ROM",
+            "left_ankle":   asdict(left_r)  if left_r  else None,
+            "right_ankle":  asdict(right_r) if right_r else None,
+            "bilateral_comparison": bilateral,
+            "normal_reference": {
+                "dorsiflexion_normal_deg":    THRESH['dorsi_normal'],
+                "dorsiflexion_flag_deg":      THRESH['dorsi_flag'],
+                "dorsiflexion_severe_deg":    THRESH['dorsi_severe'],
+                "plantarflexion_normal_deg":  THRESH['plantar_normal'],
+                "plantarflexion_flag_deg":    THRESH['plantar_flag'],
+                "plantarflexion_severe_deg":  THRESH['plantar_severe'],
+                "ama_max_le_contribution_pct": 7.0,
+            }
+        }, f, indent=2)
+
+    # TXT
+    SEP = "=" * 64
+    tp  = os.path.join(folder, f"{pid}_ankle_summary.txt")
+    with open(tp, 'w', encoding='utf-8') as f:
+        f.write(SEP + "\n  ANKLE ROM ANALYSIS REPORT\n")
+        f.write("  Standard: AAOS / AMA Guides 6th Edition\n" + SEP + "\n")
+        f.write(f"  Patient ID  : {pid}\n  Test Date   : {ts}\n" + SEP + "\n\n")
+
+        for res, lbl in [(left_r,"LEFT ANKLE"), (right_r,"RIGHT ANKLE")]:
+            if not res:
+                continue
+            f.write(f"  {lbl}\n  " + "─"*44 + "\n")
+            f.write(f"  Neutral Baseline     : {res.neutral_angle:.1f}° (ideal ~90°)\n")
+            f.write(f"  Max Dorsiflexion     : {res.max_dorsiflexion:.1f}°"
+                    f"   (normal >= {THRESH['dorsi_normal']}°)"
+                    f"   Grade: {res.dorsi_grade}"
+                    f"   Deficit: {res.dorsi_deficit:.0f}°\n")
+            f.write(f"  Max Plantarflexion   : {res.max_plantarflexion:.1f}°"
+                    f"   (normal >= {THRESH['plantar_normal']}°)"
+                    f"   Grade: {res.plantar_grade}"
+                    f"   Deficit: {res.plantar_deficit:.0f}°\n")
+            f.write(f"  Total Arc            : {res.total_arc:.1f}°"
+                    f"   (normal >= 50°)\n")
+            f.write(f"  AMA LE Impairment    : {res.impairment_pct:.1f}%"
+                    f"   (normal < 1.5%)\n")
+            status = "NORMAL" if not res.abnormalities else "RESTRICTION DETECTED"
+            f.write(f"  Overall Status       : {status}\n")
+            if res.abnormalities:
+                f.write("\n  Abnormalities:\n")
+                for a in res.abnormalities:
+                    f.write(f"    - {a}\n")
+            f.write("\n  Clinical Notes:\n")
+            for n in res.clinical_notes:
+                f.write(f"    {n}\n")
+            f.write("\n")
+
+        if bilateral:
+            f.write("  BILATERAL COMPARISON\n  " + "─"*44 + "\n")
+            f.write(f"  Dorsiflexion  diff : {bilateral['dorsiflexion_difference_deg']:.1f}°"
+                    f"   {'FLAG' if bilateral['asymmetry_flag'] else 'OK'}\n")
+            f.write(f"  Plantarflexion diff: {bilateral['plantarflexion_difference_deg']:.1f}°\n\n")
+
+        all_abn = []
+        if left_r  and left_r.abnormalities:  all_abn += left_r.abnormalities
+        if right_r and right_r.abnormalities: all_abn += right_r.abnormalities
+        f.write("  RECOMMENDATIONS\n  " + "─"*44 + "\n")
+        if not all_abn:
+            f.write("  - Ankle ROM normal bilaterally.\n")
+            f.write("  - Continue current treatment plan.\n")
+            f.write("  - Routine ROM check every 3 months.\n")
+        else:
+            severe = any("SEVERE" in a for a in all_abn)
+            if severe:
+                f.write("  - URGENT: Refer to rheumatologist / orthopaedic specialist.\n")
+                f.write("  - Consider ankle foot orthosis (AFO).\n")
+            f.write("  - Physiotherapy: ankle stretching and mobilisation.\n")
+            f.write("  - Dorsiflexion: towel stretch, wall stretch 3x daily.\n")
+            f.write("  - Plantarflexion: calf raises 3x daily, 10-15 reps.\n")
+            f.write("  - Reassess ROM in 4-6 weeks.\n")
+
+        f.write("\n  AAOS / AMA REFERENCE\n  " + "─"*44 + "\n")
+        f.write(f"  Dorsiflexion  : 0° to {THRESH['dorsi_normal']}°  (flag < {THRESH['dorsi_flag']}°)\n")
+        f.write(f"  Plantarflexion: 0° to {THRESH['plantar_normal']}°  (flag < {THRESH['plantar_flag']}°)\n")
+        f.write( "  Grades        : NORMAL / MILD / SEVERE\n")
+        f.write(SEP + "\n")
+
+    print(f"  📄 TXT  -> {tp}")
+    print(f"  📊 JSON -> {jp}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SINGLE FOOT ANALYZER
+# ═══════════════════════════════════════════════════════════════
+
+class FootAnalyzer:
+    def __init__(self, cap, pose, side, pid, out):
+        self.cap         = cap
+        self.pose        = pose
+        self.side        = side
+        self.pid         = pid
+        self.out         = out
+        self.state       = TestState.NEUTRAL_BASELINE
+        self.neutral     = 90.0   # default neutral, overwritten at baseline
+        self.max_dorsi   = 0.0
+        self.max_plantar = 0.0
+        self.buf         = deque(maxlen=STAB['buf'])
+        self.hist        = []
+        self.hold_t      = None
+
+    def _stable(self, a):
+        self.buf.append(a)
+        if len(self.buf) < STAB['buf']:
+            return False
+        return float(np.var(list(self.buf))) < STAB['variance']
+
+    def _plateaued(self, a):
+        if self.state not in (TestState.DORSIFLEXION_TEST, TestState.PLANTAR_TEST):
+            return True
+        self.hist.append(a)
+        if len(self.hist) > STAB['plateau_win']:
+            self.hist.pop(0)
+        if len(self.hist) < STAB['plateau_win']:
+            return False
+        recent  = float(np.mean(self.hist[-5:]))
+        earlier = float(np.mean(self.hist[:5]))
+        return abs(recent - earlier) < STAB['plateau_tol']
+
+    def _capture_advance(self, frame, pose_lm, raw_angle, dev):
+        ann = annotated_capture(frame, pose_lm, self.side,
+                                raw_angle, dev, self.state, WINDOW_W, WINDOW_H)
+        fname = os.path.join(
+            self.out,
+            f"{self.pid}_{self.side}_{self.state.name}_{abs(dev):.0f}deg.jpg"
+        )
+        cv2.imwrite(fname, ann)
+        print(f"  📸 {fname}")
+
+        if   self.state == TestState.NEUTRAL_BASELINE:
+            self.neutral = raw_angle
+            self.state   = TestState.DORSIFLEXION_TEST
+        elif self.state == TestState.DORSIFLEXION_TEST:
+            self.state   = TestState.PLANTAR_TEST
+        elif self.state == TestState.PLANTAR_TEST:
+            self.state   = TestState.COMPLETE
+
+        self.hold_t = None
+        self.buf.clear()
+        self.hist.clear()
+
+    def _show_intro(self):
+        deadline = time.time() + 2.5
+        while time.time() < deadline:
+            ret, raw = self.cap.read()
+            frame = cv2.resize(
+                cv2.flip(raw, 1) if ret else np.zeros((WINDOW_H,WINDOW_W,3), np.uint8),
+                (WINDOW_W, WINDOW_H)
+            )
+            ov = frame.copy()
+            cv2.rectangle(ov, (0,0),(WINDOW_W,WINDOW_H),(0,0,0),-1)
+            cv2.addWeighted(ov, 0.72, frame, 0.28, 0, frame)
+
+            bc = (155,48,0) if self.side=='left' else (0,68,155)
+            rrect(frame, WINDOW_W//2-240, WINDOW_H//2-80,
+                  WINDOW_W//2+240, WINDOW_H//2+80, 16, bc, alpha=0.92)
+            t(frame, f"Testing  {self.side.upper()}  ANKLE",
+              WINDOW_W//2-195, WINDOW_H//2-25, 0.88, CW, 2, bold=True)
+            t(frame, f"Sit on chair — {self.side.upper()} side to camera",
+              WINDOW_W//2-220, WINDOW_H//2+20, 0.56, CW, 1)
+            t(frame, "Foot hanging free (not touching floor)",
+              WINDOW_W//2-210, WINDOW_H//2+52, 0.50, (180,180,180), 1)
+            t(frame, "Full lower leg visible in frame",
+              WINDOW_W//2-180, WINDOW_H//2+74, 0.46, (150,150,150), 1)
+
+            cv2.imshow("Ankle ROM Analyzer", frame)
+            if (cv2.waitKey(40) & 0xFF) == ord('q'):
+                return False
+        return True
+
+    def run(self) -> Optional[AnkleResult]:
+        if not self._show_intro():
+            return None
+
+        while True:
+            ret, raw = self.cap.read()
+            if not ret:
+                break
+
+            raw   = cv2.flip(raw, 1)
+            frame = cv2.resize(raw, (WINDOW_W, WINDOW_H))
+            rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            res   = self.pose.process(rgb)
+
+            # COMPLETE → show report
+            if self.state == TestState.COMPLETE:
+                result   = analyze(self.neutral, self.max_dorsi,
+                                   self.max_plantar, self.side)
+                deadline = time.time() + REPORT_SECS
+                while time.time() < deadline:
+                    sl = deadline - time.time()
+                    cv2.imshow("Ankle ROM Analyzer",
+                               draw_report_screen(result, sl))
+                    k = cv2.waitKey(40) & 0xFF
+                    if k == ord('q'):
+                        return result
+                return result
+
+            # ACTIVE TEST
+            if res.pose_landmarks:
+                kp, ap, fp, hp, vis, *_ = get_foot(res.pose_landmarks, self.side)
+
+                if vis > 0.30:
+                    raw_angle = ankle_angle_raw(kp, ap, fp)
+                    dev       = deviation_from_neutral(raw_angle, self.neutral)
+
+                    # Track maxima
+                    if self.state == TestState.DORSIFLEXION_TEST:
+                        self.max_dorsi   = max(self.max_dorsi,   dev)
+                    if self.state == TestState.PLANTAR_TEST:
+                        self.max_plantar = max(self.max_plantar, -dev)
+
+                    ok, msg, hint = validate(raw_angle, self.neutral, self.state)
+                    stable    = self._stable(raw_angle)
+                    plateaued = self._plateaued(raw_angle)
+                    ready     = ok and stable and plateaued
+
+                    countdown = None
+                    if ready:
+                        if self.hold_t is None:
+                            self.hold_t = time.time()
+                        remaining = STAB['hold_sec'] - (time.time() - self.hold_t)
+                        countdown = max(0.0, remaining)
+                        if remaining <= 0:
+                            self._capture_advance(frame.copy(),
+                                                  res.pose_landmarks,
+                                                  raw_angle, dev)
+                            continue
+                    else:
+                        self.hold_t = None
+
+                    frame = draw_live(
+                        frame, res.pose_landmarks, raw_angle, dev,
+                        self.state, self.side,
+                        ok, msg, hint,
+                        max(0.0, self.max_dorsi),
+                        max(0.0, self.max_plantar),
+                        countdown, stable, WINDOW_W, WINDOW_H
+                    )
+                else:
+                    rrect(frame, 8, WINDOW_H-68, 600, WINDOW_H-8, 6, (52,0,0), 0.8)
+                    t(frame, "Low visibility — ensure full foot is visible in frame",
+                      18, WINDOW_H-30, 0.54, CR, 2)
+            else:
+                rrect(frame, 8, WINDOW_H-68, 600, WINDOW_H-8, 6, (52,0,0), 0.8)
+                t(frame, "Body not detected — sit closer / improve lighting",
+                  18, WINDOW_H-30, 0.54, CR, 2)
+
+            cv2.imshow("Ankle ROM Analyzer", frame)
+            k = cv2.waitKey(10) & 0xFF
+            if k == ord('q'):
+                return None
+            elif k == ord('r'):
+                self.state       = TestState.NEUTRAL_BASELINE
+                self.neutral     = 90.0
+                self.max_dorsi   = 0.0
+                self.max_plantar = 0.0
+                self.buf.clear()
+                self.hist.clear()
+                self.hold_t = None
+
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════
+
+def main():
+    print("\n" + "═"*54)
+    print("  ANKLE ROM ANALYZER")
+    print("  Rheumatoid Arthritis Detection")
+    print("  Standard: AAOS / AMA Guides 6th Edition")
+    print("═"*54)
+    print("\n  PATIENT SETUP:")
+    print("  • Sit on chair, foot hanging free (not on floor)")
+    print("  • Side-profile to camera — full lower leg visible")
+    print("  • Left test  → left side toward camera")
+    print("  • Right test → turn around, right side to camera")
+    print("═"*54)
+
+    pid = input("\n  Patient ID (e.g. P001): ").strip()
+    if not pid:
+        print("  Patient ID required.")
+        return
+
+    cam = select_camera()
+    out = os.path.join("ankle_output", pid)
+    os.makedirs(out, exist_ok=True)
+
+    print("\n  Connecting to camera...")
+    cap = cv2.VideoCapture(cam)
+    if not cap.isOpened():
+        print(f"  Cannot open camera: {cam}")
+        return
+    ret, _ = cap.read()
+    if not ret:
+        print("  Camera open but no frames.")
+        cap.release()
+        return
+    print("  Camera ready\n")
+
+    pose = mp.solutions.pose.Pose(
+        static_image_mode=False, model_complexity=1,
+        min_detection_confidence=0.60, min_tracking_confidence=0.60
+    )
+
+    cv2.namedWindow("Ankle ROM Analyzer", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Ankle ROM Analyzer", WINDOW_W, WINDOW_H)
+
+    # LEFT FOOT
+    print("  Starting LEFT ankle test (automatic)...")
+    left_r = FootAnalyzer(cap, pose, 'left', pid+"_L", out).run()
+
+    # TRANSITION + RIGHT FOOT
+    right_r = None
+    if left_r is not None:
+        if draw_transition(cap, INTER_FOOT_SEC):
+            print("  Starting RIGHT ankle test (automatic)...")
+            right_r = FootAnalyzer(cap, pose, 'right', pid+"_R", out).run()
+
+    # SAVE COMBINED REPORT
+    if left_r or right_r:
+        print("\n  Saving combined report...")
+        save_report(out, pid, left_r, right_r)
+        print(f"  All files: ankle_output/{pid}/")
+
+    cap.release()
+    cv2.destroyAllWindows()
+    print("  Done.\n")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,973 @@
+"""
+Knee Joint ROM Analysis — Rheumatoid Arthritis Detection
+MediaPipe Pose | AAOS / AMA Guides 6th Edition
+
+FULLY AUTOMATIC FLOW — no button needed:
+  Patient stands SIDE-ON to camera (left side first)
+  LEFT  leg  → Neutral → Extension → Flexion → 10s report
+             → AUTO-START RIGHT leg
+  RIGHT leg  → Neutral → Extension → Flexion → 10s report
+             → window closes, combined JSON + TXT saved
+
+CAMERA POSITION:
+  Patient stands side-profile to camera.
+  Left side test: left side faces camera.
+  Right side test: right side faces camera.
+
+MEDICAL REFERENCE — AAOS / AMA Guides 6th Ed.:
+  Knee Flexion    : 0° → 135°   mild flag < 110°   severe < 80°
+  Knee Extension  : return to 0° flag > 10°         severe > 30°
+  Flexion Contracture = inability to fully extend
+
+Author: Knee ROM Analysis System | 2025
+"""
+
+import cv2
+import mediapipe as mp
+import numpy as np
+import time
+import json
+import os
+from dataclasses import dataclass, asdict
+from typing import List, Tuple, Optional
+from enum import Enum
+from collections import deque
+from datetime import datetime
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CONFIGURATION
+# ═══════════════════════════════════════════════════════════════
+
+WINDOW_W, WINDOW_H = 960, 600
+
+class TestState(Enum):
+    WAITING          = 0
+    NEUTRAL_BASELINE = 1
+    EXTENSION_TEST   = 2   # straighten leg first
+    FLEXION_TEST     = 3   # bend knee second
+    COMPLETE         = 4
+
+# ── AAOS / AMA 6th Ed. thresholds ──────────────────────────
+THRESH = {
+    'neutral_max':       10,    # leg at rest should be < 10°
+    'extension_flag':    10,    # mild restriction if > 10°
+    'extension_severe':  30,    # severe flexion contracture
+    'flexion_normal':   135,    # AAOS full flexion
+    'flexion_mild':     110,    # mild restriction
+    'flexion_moderate':  80,    # moderate restriction
+    'flexion_severe':    60,    # severe restriction
+}
+
+# ── Stability settings ──────────────────────────────────────
+STAB = {
+    'buf':         8,
+    'variance':    9.0,
+    'hold_sec':    0.5,
+    'plateau_win': 10,
+    'plateau_tol': 3.0,
+}
+
+REPORT_SECS   = 10
+INTER_LEG_SEC =  3
+
+# BGR colours
+CG  = (  0, 220,   0)
+CR  = (  0,   0, 210)
+CO  = (  0, 155, 255)
+CY  = (  0, 205, 255)
+CC  = (255, 215,   0)
+CW  = (235, 235, 235)
+CLB = (255, 195,  95)
+CDK = ( 16,  16,  26)
+CGR = (100, 100, 100)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  DATA CLASS
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class KneeResult:
+    side:               str
+    neutral_angle:      float
+    max_flexion:        float
+    min_extension:      float
+    flexion_grade:      str
+    extension_grade:    str
+    flexion_deficit:    float
+    extension_deficit:  float
+    total_arc:          float
+    impairment_pct:     float
+    timestamp:          str
+    abnormalities:      List[str]
+    clinical_notes:     List[str]
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CAMERA SELECTION
+# ═══════════════════════════════════════════════════════════════
+
+def select_camera():
+    print("\n" + "─" * 50)
+    print("  CAMERA SELECTION")
+    print("─" * 50)
+    print("  1.  Built-in Webcam")
+    print("  2.  DroidCam  (WiFi)")
+    print("─" * 50)
+    while True:
+        c = input("  Enter 1 or 2: ").strip()
+        if c == '1':
+            return 0
+        if c == '2':
+            ip   = input("  DroidCam IP  (default 192.168.100.48): ").strip() or "192.168.100.48"
+            port = input("  Port         (default 4747): ").strip() or "4747"
+            return f"http://{ip}:{port}/video"
+        print("  Please enter 1 or 2")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  GEOMETRY — Knee angle
+# ═══════════════════════════════════════════════════════════════
+
+def knee_angle(hip, knee, ankle) -> float:
+    """
+    Flexion angle at knee:
+    0°   = fully straight leg
+    135° = fully bent (heel near buttock)
+    Uses 3-point angle at knee joint.
+    """
+    v1 = hip   - knee
+    v2 = ankle - knee
+    n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+    if n1 < 1e-6 or n2 < 1e-6:
+        return 0.0
+    cos_a    = np.clip(np.dot(v1 / n1, v2 / n2), -1.0, 1.0)
+    interior = np.degrees(np.arccos(cos_a))   # 180° = straight
+    return max(0.0, 180.0 - interior)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  LANDMARK HELPER
+# ═══════════════════════════════════════════════════════════════
+
+def get_leg(pose_lm, side: str):
+    """
+    Returns hip, knee, ankle numpy arrays for given side.
+    NOTE: For side-profile testing, we use the visible leg.
+    Left side test  → use LEFT  landmarks (patient's left side toward camera)
+    Right side test → use RIGHT landmarks (patient's right side toward camera)
+    Camera is flipped so MediaPipe left/right matches user's side facing camera.
+    """
+    P = mp.solutions.pose.PoseLandmark
+    if side == 'left':
+        hi, ki, ai = P.LEFT_HIP.value, P.LEFT_KNEE.value, P.LEFT_ANKLE.value
+    else:
+        hi, ki, ai = P.RIGHT_HIP.value, P.RIGHT_KNEE.value, P.RIGHT_ANKLE.value
+    lm  = pose_lm.landmark
+    hp  = np.array([lm[hi].x, lm[hi].y, lm[hi].z])
+    kp  = np.array([lm[ki].x, lm[ki].y, lm[ki].z])
+    ap  = np.array([lm[ai].x, lm[ai].y, lm[ai].z])
+    vis = min(lm[hi].visibility, lm[ki].visibility, lm[ai].visibility)
+    return hp, kp, ap, vis, hi, ki, ai
+
+
+# ═══════════════════════════════════════════════════════════════
+#  POSTURE VALIDATION + DIRECTIONAL GUIDANCE
+# ═══════════════════════════════════════════════════════════════
+
+def validate(angle: float, state: TestState) -> Tuple[bool, str, str]:
+    """Returns (ok, status_message, direction_hint)"""
+
+    if state == TestState.NEUTRAL_BASELINE:
+        if angle <= THRESH['neutral_max']:
+            return True,  f"Good — leg straight  ({angle:.0f}°)", ""
+        diff = angle - THRESH['neutral_max']
+        return False, \
+               f"Straighten leg  ({angle:.0f}°  need < {THRESH['neutral_max']}°)", \
+               f"  Straighten your knee — let leg hang relaxed"
+
+    elif state == TestState.EXTENSION_TEST:
+        if angle <= THRESH['extension_flag']:
+            return True,  f"Good extension  ({angle:.0f}°)", ""
+        elif angle <= 35:
+            return True,  f"Keep straightening  ({angle:.0f}°)", \
+                          f"  Push knee back — try to reach 0°"
+        else:
+            return False, f"Bend in knee  ({angle:.0f}°  need < {THRESH['extension_flag']}°)", \
+                          f"  Straighten your knee fully — push back"
+
+    elif state == TestState.FLEXION_TEST:
+        if angle >= 100:
+            return True,  f"Good flexion  ({angle:.0f}°)", ""
+        elif angle >= 60:
+            return True,  f"Keep bending  ({angle:.0f}°)", \
+                          f"  Lift heel UP — bend knee more"
+        elif angle >= 30:
+            return False, f"Bend knee more  ({angle:.0f}°  need > 60°)", \
+                          f"  Lift heel toward buttock — bend at knee"
+        else:
+            return False, f"Start bending knee  ({angle:.0f}°)", \
+                          f"  Raise heel UP — bend your knee joint"
+
+    return True, "Position OK", ""
+
+
+# ═══════════════════════════════════════════════════════════════
+#  MEDICAL GRADING
+# ═══════════════════════════════════════════════════════════════
+
+def grade_flexion(angle: float) -> Tuple[str, float, str]:
+    deficit = max(0.0, THRESH['flexion_normal'] - angle)
+    if angle >= THRESH['flexion_mild']:
+        return "NORMAL",   deficit, "Flexion within AAOS normal limits."
+    elif angle >= THRESH['flexion_moderate']:
+        return "MILD",     deficit, f"Mild flexion restriction — {deficit:.0f}° below normal. Monitor."
+    elif angle >= THRESH['flexion_severe']:
+        return "MODERATE", deficit, f"Moderate flexion restriction — {deficit:.0f}° deficit. Physiotherapy indicated."
+    else:
+        return "SEVERE",   deficit, f"Severe flexion restriction — {deficit:.0f}° deficit. Urgent evaluation."
+
+
+def grade_extension(angle: float) -> Tuple[str, float, str]:
+    deficit = max(0.0, angle)
+    if angle <= THRESH['extension_flag']:
+        return "NORMAL", deficit, "Extension within AAOS normal limits."
+    elif angle <= THRESH['extension_severe']:
+        return "MILD",   deficit, f"Mild flexion contracture — {deficit:.0f}° extension deficit."
+    else:
+        return "SEVERE", deficit, f"Significant flexion contracture — {deficit:.0f}° deficit. Referral advised."
+
+
+def estimate_impairment(total_arc: float) -> float:
+    """AMA Guides 6th Ed. — max knee lower-extremity contribution ~7%."""
+    full_arc = 135.0
+    return round(max(0.0, (1.0 - min(total_arc / full_arc, 1.0)) * 7.0), 1)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ANNOTATED IMAGE CAPTURE
+# ═══════════════════════════════════════════════════════════════
+
+def annotated_capture(frame, pose_lm, side, angle, state, w, h) -> np.ndarray:
+    img = frame.copy()
+    P   = mp.solutions.pose.PoseLandmark
+    if side == 'left':
+        hi, ki, ai = P.LEFT_HIP.value, P.LEFT_KNEE.value, P.LEFT_ANKLE.value
+    else:
+        hi, ki, ai = P.RIGHT_HIP.value, P.RIGHT_KNEE.value, P.RIGHT_ANKLE.value
+    lm = pose_lm.landmark
+    hp = (int(lm[hi].x * w), int(lm[hi].y * h))
+    kp = (int(lm[ki].x * w), int(lm[ki].y * h))
+    ap = (int(lm[ai].x * w), int(lm[ai].y * h))
+
+    # Skeleton lines
+    cv2.line(img, hp, kp, (0, 200, 0),   3, cv2.LINE_AA)
+    cv2.line(img, kp, ap, (0, 160, 220), 3, cv2.LINE_AA)
+
+    # Joint circles + coordinate labels
+    for pt, col, name in [(hp, (0,220,220), "Hip"),
+                           (kp, (0,255,0),  "Knee"),
+                           (ap, (255,180,0),"Ankle")]:
+        cv2.circle(img, pt, 10, (0,0,0), -1, cv2.LINE_AA)
+        cv2.circle(img, pt,  7, col,     -1, cv2.LINE_AA)
+        cv2.putText(img, f"{name} ({pt[0]},{pt[1]})",
+                    (pt[0]+12, pt[1]+5), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42, col, 1, cv2.LINE_AA)
+
+    # Angle at knee
+    cv2.putText(img, f"{angle:.1f} deg",
+                (kp[0]+16, kp[1]-18), cv2.FONT_HERSHEY_DUPLEX,
+                0.9, (0,255,255), 2, cv2.LINE_AA)
+    if angle > 3:
+        cv2.ellipse(img, kp, (55,55), -90, 0, int(min(angle,135)),
+                    (0,255,255), 2, cv2.LINE_AA)
+
+    # Header bar
+    cv2.rectangle(img, (0,0), (w,52), (0,0,0), -1)
+    ts = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
+    cv2.putText(img, f"{side.upper()} Knee — {state.name}  |  {angle:.1f} deg",
+                (10, 20), cv2.FONT_HERSHEY_DUPLEX, 0.52, (0,220,220), 1)
+    cv2.putText(img, ts, (10, 44),
+                cv2.FONT_HERSHEY_DUPLEX, 0.42, (155,155,155), 1)
+
+    # Landmark table bottom-right
+    rows = [
+        f"Hip    x={lm[hi].x:.3f}  y={lm[hi].y:.3f}  z={lm[hi].z:.3f}",
+        f"Knee   x={lm[ki].x:.3f}  y={lm[ki].y:.3f}  z={lm[ki].z:.3f}",
+        f"Ankle  x={lm[ai].x:.3f}  y={lm[ai].y:.3f}  z={lm[ai].z:.3f}",
+    ]
+    by = h - 10 - len(rows) * 20
+    cv2.rectangle(img, (w-384, by-8), (w-2, h-2), (20,20,20), -1)
+    for i, row in enumerate(rows):
+        cv2.putText(img, row, (w-380, by + i*20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (175,175,175), 1)
+    return img
+
+
+# ═══════════════════════════════════════════════════════════════
+#  GUI HELPERS
+# ═══════════════════════════════════════════════════════════════
+
+def rrect(img, x1, y1, x2, y2, r, color, alpha=0.78):
+    ov = img.copy()
+    cv2.rectangle(ov, (x1+r, y1), (x2-r, y2), color, -1)
+    cv2.rectangle(ov, (x1, y1+r), (x2, y2-r), color, -1)
+    for cx, cy in [(x1+r,y1+r),(x2-r,y1+r),(x1+r,y2-r),(x2-r,y2-r)]:
+        cv2.circle(ov, (cx,cy), r, color, -1)
+    cv2.addWeighted(ov, alpha, img, 1-alpha, 0, img)
+
+
+def t(img, text, x, y, sc=0.55, col=CW, th=1, bold=False):
+    f = cv2.FONT_HERSHEY_DUPLEX
+    if bold:
+        cv2.putText(img, text, (x, y), f, sc, (0,0,0), th+2)
+    cv2.putText(img, text, (x, y), f, sc, col, th)
+
+
+def arc_gauge(img, cx, cy, rad, angle, max_a=135):
+    cv2.ellipse(img, (cx,cy), (rad,rad), -90, 0, max_a,
+                (50,50,50), 8, cv2.LINE_AA)
+    if angle > 2:
+        col = CG if (angle >= THRESH['flexion_mild'] or angle <= THRESH['extension_flag']) else CO
+        cv2.ellipse(img, (cx,cy), (rad,rad), -90, 0,
+                    int(min(angle, max_a)), col, 8, cv2.LINE_AA)
+    ra = np.radians(-90 + min(angle, max_a))
+    tx = int(cx + rad * np.cos(ra))
+    ty = int(cy + rad * np.sin(ra))
+    cv2.circle(img, (tx, ty), 10, CY, -1, cv2.LINE_AA)
+    cv2.circle(img, (tx, ty),  5, CW, -1, cv2.LINE_AA)
+
+
+def draw_skeleton_live(frame, pose_lm, side, w, h, angle):
+    P = mp.solutions.pose.PoseLandmark
+    if side == 'left':
+        hi, ki, ai = P.LEFT_HIP.value, P.LEFT_KNEE.value, P.LEFT_ANKLE.value
+    else:
+        hi, ki, ai = P.RIGHT_HIP.value, P.RIGHT_KNEE.value, P.RIGHT_ANKLE.value
+    lm = pose_lm.landmark
+    hp = (int(lm[hi].x*w), int(lm[hi].y*h))
+    kp = (int(lm[ki].x*w), int(lm[ki].y*h))
+    ap = (int(lm[ai].x*w), int(lm[ai].y*h))
+    # glow
+    cv2.line(frame, hp, kp, (0,70,0),  10, cv2.LINE_AA)
+    cv2.line(frame, kp, ap, (0,55,95),  9, cv2.LINE_AA)
+    cv2.line(frame, hp, kp, CG,   4, cv2.LINE_AA)
+    cv2.line(frame, kp, ap, CLB,  3, cv2.LINE_AA)
+    for pt, col, r in [(hp,CY,9),(kp,CC,13),(ap,CLB,9)]:
+        cv2.circle(frame, pt, r+3, (0,0,0), -1, cv2.LINE_AA)
+        cv2.circle(frame, pt, r,   col,     -1, cv2.LINE_AA)
+    t(frame, f"{angle:.0f}°", kp[0]+14, kp[1]-14, 0.80, CY, 2, bold=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  LIVE UI
+# ═══════════════════════════════════════════════════════════════
+
+def draw_live(frame, pose_lm, angle, state, side,
+              ok, msg, hint, max_flex, min_ext,
+              countdown, stable, w, h):
+
+    draw_skeleton_live(frame, pose_lm, side, w, h, angle)
+
+    # TOP BAR
+    rrect(frame, 0, 0, w, 70, 0, (14,14,24), alpha=0.90)
+    steps = {
+        TestState.NEUTRAL_BASELINE: ("STEP 1 / 3", "Stand STRAIGHT — leg fully extended at side"),
+        TestState.EXTENSION_TEST:   ("STEP 2 / 3", "STRAIGHTEN knee — push leg back to 0°"),
+        TestState.FLEXION_TEST:     ("STEP 3 / 3", "BEND knee — lift heel UP toward buttock"),
+    }
+    sl, si_ = steps.get(state, ("", ""))
+    t(frame, sl,  14, 26, 0.52, CC, 1)
+    t(frame, si_, 14, 56, 0.60, CW, 1)
+
+    # Side badge
+    bc = (155, 48, 0) if side == 'left' else (0, 68, 155)
+    rrect(frame, w-132, 6, w-6, 64, 6, bc, alpha=0.92)
+    t(frame, f"{side.upper()} LEG", w-124, 44, 0.64, CW, 2)
+
+    # Camera hint
+    rrect(frame, w-310, 70, w-6, 108, 4, (30,30,50), alpha=0.85)
+    t(frame, "Side-profile to camera", w-300, 96, 0.44, (180,180,180), 1)
+
+    # ARC GAUGE
+    gcx, gcy = w-92, h-118
+    arc_gauge(frame, gcx, gcy, 70, angle)
+    t(frame, f"{angle:.0f}°", gcx-22, gcy+20, 0.80, CY, 2, bold=True)
+    t(frame, "ANGLE",         gcx-26, gcy+42, 0.42, CW,  1)
+
+    # POSTURE FEEDBACK
+    fy = h - 108
+    rrect(frame, 8, fy, 535, h-8, 8,
+          (0,52,0) if ok else (52,0,0), alpha=0.80)
+    t(frame, msg,  18, fy+30, 0.58, CG if ok else CR, 2)
+    if hint:
+        t(frame, hint, 18, fy+58, 0.50, CO, 1)
+
+    # PROGRESS BARS
+    rrect(frame, 8, 82, 222, 235, 8, (18,18,32), alpha=0.80)
+    t(frame, "PROGRESS", 18, 106, 0.48, CC, 1)
+    bw = 194
+
+    ext_v = min_ext if min_ext < 180 else 0.0
+    t(frame, f"Extension: {ext_v:.0f}°", 18, 134, 0.44, CW, 1)
+    ep_frac = max(0.0, 1.0 - ext_v / 50.0)
+    cv2.rectangle(frame, (18,142), (18+bw,154), (45,45,45), -1)
+    cv2.rectangle(frame, (18,142), (18+int(bw*ep_frac),154),
+                  CG if ext_v <= THRESH['extension_flag'] else CO, -1)
+
+    t(frame, f"Flexion:   {max_flex:.0f}°", 18, 178, 0.44, CW, 1)
+    fp_frac = min(max_flex / THRESH['flexion_normal'], 1.0)
+    cv2.rectangle(frame, (18,186), (18+bw,198), (45,45,45), -1)
+    cv2.rectangle(frame, (18,186), (18+int(bw*fp_frac),198),
+                  CG if max_flex >= THRESH['flexion_mild'] else CO, -1)
+
+    # COUNTDOWN
+    if countdown is not None and countdown > 0:
+        rrect(frame, w//2-110, h//2-50, w//2+110, h//2+50, 14,
+              (0, 90, 0), alpha=0.92)
+        t(frame, "Capturing...", w//2-88, h//2-10, 0.72, CG, 2, bold=True)
+        t(frame, f"{countdown:.1f}s", w//2-38, h//2+32, 0.80, CY, 2, bold=True)
+    elif stable and ok:
+        t(frame, "STABLE", w-165, 110, 0.52, CG, 2)
+    else:
+        t(frame, "Stabilising...", w-210, 110, 0.46, CO, 1)
+
+    return frame
+
+
+# ═══════════════════════════════════════════════════════════════
+#  TRANSITION SCREEN
+# ═══════════════════════════════════════════════════════════════
+
+def draw_transition(cap, seconds=INTER_LEG_SEC):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        ret, raw = cap.read()
+        frame = cv2.resize(cv2.flip(raw, 1) if ret else
+                           np.zeros((WINDOW_H, WINDOW_W, 3), np.uint8),
+                           (WINDOW_W, WINDOW_H))
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0,0), (WINDOW_W, WINDOW_H), (0,0,0), -1)
+        cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+
+        secs_left = deadline - time.time()
+        t(frame, "LEFT LEG COMPLETE",
+          WINDOW_W//2 - 168, WINDOW_H//2 - 55, 0.88, CG, 2, bold=True)
+        t(frame, f"Starting RIGHT leg in  {secs_left:.0f}s ...",
+          WINDOW_W//2 - 210, WINDOW_H//2 + 10, 0.72, CC, 2)
+        t(frame, "Turn around — RIGHT side to camera",
+          WINDOW_W//2 - 195, WINDOW_H//2 + 55, 0.58, CW, 1)
+
+        bw = WINDOW_W - 40
+        bf = int(bw * (secs_left / seconds))
+        cv2.rectangle(frame, (20, WINDOW_H-14), (20+bw, WINDOW_H-4), (45,45,45), -1)
+        cv2.rectangle(frame, (20, WINDOW_H-14), (20+bf,  WINDOW_H-4), CC, -1)
+
+        cv2.imshow("Knee ROM Analyzer", frame)
+        if (cv2.waitKey(40) & 0xFF) == ord('q'):
+            return False
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════
+#  REPORT SCREEN
+# ═══════════════════════════════════════════════════════════════
+
+def draw_report_screen(result: KneeResult, secs_left: float):
+    img = np.zeros((WINDOW_H, WINDOW_W, 3), dtype=np.uint8)
+    img[:] = CDK
+
+    # Header
+    rrect(img, 0, 0, WINDOW_W, 56, 0, (26,26,44), alpha=1.0)
+    t(img, "KNEE ROM REPORT", WINDOW_W//2-128, 38, 0.92, CC, 2, bold=True)
+    t(img, f"Auto-close in  {secs_left:.0f}s",
+      WINDOW_W-205, 38, 0.46, (120,120,120), 1)
+    cv2.line(img, (26,60), (WINDOW_W-26,60), (52,52,72), 1)
+
+    # Side badge
+    sc = (155,48,0) if result.side == 'left' else (0,68,155)
+    rrect(img, 26, 68, 200, 108, 6, sc, alpha=0.92)
+    t(img, f"{result.side.upper()} KNEE", 38, 96, 0.64, CW, 2)
+    t(img, result.timestamp, WINDOW_W-340, 92, 0.40, (120,120,120), 1)
+
+    y = 116
+    cv2.line(img, (26,y), (WINDOW_W-26,y), (36,36,52), 1)
+    y += 16
+
+    # Measurements
+    t(img, "MEASUREMENTS  (AAOS / AMA 6th Ed.)", 32, y+14, 0.55, CC, 1)
+    y += 34
+
+    grade_colors = {
+        "NORMAL":   (CG,   (22,38,22)),
+        "MILD":     (CO,   (42,28,10)),
+        "MODERATE": (CR,   (44,18,18)),
+        "SEVERE":   ((0,0,180), (55,10,10)),
+    }
+
+    def mrow(label, val_str, ref_str, grade, yy):
+        gc, bg = grade_colors.get(grade, (CW, (25,25,40)))
+        rrect(img, 30, yy-20, WINDOW_W-30, yy+12, 4, bg, alpha=0.90)
+        t(img, label,            36,           yy, 0.49, CW,  1)
+        t(img, val_str,         316,           yy, 0.58, CY,  2)
+        t(img, ref_str,         388,           yy, 0.40, CGR, 1)
+        t(img, grade, WINDOW_W-122, yy, 0.52, gc, 2)
+
+    arc_ok = result.total_arc >= 100
+    imp_ok = result.impairment_pct < 1.5
+
+    mrow("Max Flexion   (bend knee up)",
+         f"{result.max_flexion:.0f}°",
+         f"normal >= {THRESH['flexion_normal']}°",
+         result.flexion_grade, y);   y += 38
+
+    mrow("Min Extension  (straighten down)",
+         f"{result.min_extension:.0f}°",
+         f"normal <= {THRESH['extension_flag']}°",
+         result.extension_grade, y); y += 38
+
+    mrow("Total Arc of Motion",
+         f"{result.total_arc:.0f}°",
+         "normal >= 120°",
+         "NORMAL" if arc_ok else "MODERATE", y); y += 38
+
+    mrow("AMA LE Impairment Estimate",
+         f"{result.impairment_pct:.1f}%",
+         "normal < 1.5% LE",
+         "NORMAL" if imp_ok else ("MILD" if result.impairment_pct < 4 else "MODERATE"),
+         y); y += 44
+
+    cv2.line(img, (26,y), (WINDOW_W-26,y), (36,36,52), 1)
+    y += 14
+
+    # Clinical summary
+    t(img, "CLINICAL SUMMARY", 32, y+14, 0.55, CC, 1)
+    y += 32
+    notes = result.clinical_notes
+    bg2 = (18,42,18) if not result.abnormalities else (44,18,18)
+    rrect(img, 30, y-2, WINDOW_W-30, y+len(notes)*28+10, 6, bg2, alpha=0.88)
+    nc = CG if not result.abnormalities else CO
+    for n in notes:
+        t(img, f"  {n}", 40, y+20, 0.47, nc, 1)
+        y += 28
+    y += 16
+    cv2.line(img, (26,y), (WINDOW_W-26,y), (36,36,52), 1)
+    y += 14
+
+    # Recommendations
+    t(img, "RECOMMENDATIONS", 32, y+14, 0.55, CC, 1)
+    y += 32
+    if not result.abnormalities:
+        recs = ["Continue current treatment and exercise plan.",
+                "Routine knee ROM monitoring every 3 months."]
+        rc = CG
+    elif result.flexion_grade == "SEVERE" or result.extension_grade == "SEVERE":
+        recs = ["URGENT: Refer to rheumatologist / orthopaedic specialist.",
+                "Physiotherapy: knee mobilisation and strengthening.",
+                "Flexion/extension exercises: 4x daily, 15 reps.",
+                "Consider bracing if flexion contracture is present."]
+        rc = CR
+    else:
+        recs = ["Clinical evaluation recommended for ROM restriction.",
+                "Physiotherapy: knee stretching 3x daily, 10 reps.",
+                "Heat therapy before exercises improves ROM.",
+                "Reassess in 6 weeks and track progression."]
+        rc = CO
+    for r in recs:
+        t(img, f"  {r}", 40, y+18, 0.46, rc, 1)
+        y += 26
+
+    # Timer bar
+    bw2 = WINDOW_W - 40
+    bf2 = int(bw2 * (secs_left / REPORT_SECS))
+    cv2.rectangle(img, (20, WINDOW_H-10), (20+bw2, WINDOW_H-3), (42,42,42), -1)
+    cv2.rectangle(img, (20, WINDOW_H-10), (20+bf2,  WINDOW_H-3), CC,         -1)
+
+    return img
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CLINICAL ANALYSIS
+# ═══════════════════════════════════════════════════════════════
+
+def analyze(neutral, max_flex, min_ext, side) -> KneeResult:
+    fg, fd, fn = grade_flexion(max_flex)
+    eg, ed, en = grade_extension(min_ext)
+    total_arc  = max(0.0, max_flex - min_ext)
+    impairment = estimate_impairment(total_arc)
+
+    abn, notes = [], []
+    if fg != "NORMAL":
+        abn.append(f"Reduced flexion: {max_flex:.0f}° [{fg}] — {fn}")
+    if eg != "NORMAL":
+        abn.append(f"Extension restriction: {min_ext:.0f}° [{eg}] — {en}")
+    notes.append(fn)
+    notes.append(en)
+    if not abn:
+        notes.append(f"Total arc {total_arc:.0f}° — full functional ROM maintained.")
+
+    return KneeResult(
+        side=side, neutral_angle=neutral,
+        max_flexion=max_flex, min_extension=min_ext,
+        flexion_grade=fg, extension_grade=eg,
+        flexion_deficit=fd, extension_deficit=ed,
+        total_arc=total_arc, impairment_pct=impairment,
+        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        abnormalities=abn, clinical_notes=notes
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+#  REPORT SAVING
+# ═══════════════════════════════════════════════════════════════
+
+def save_report(folder, pid, left_r: Optional[KneeResult],
+                right_r: Optional[KneeResult]):
+    os.makedirs(folder, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # JSON
+    bilateral = None
+    if left_r and right_r:
+        df = abs(left_r.max_flexion   - right_r.max_flexion)
+        de = abs(left_r.min_extension - right_r.min_extension)
+        bilateral = {
+            "flexion_difference_deg":   round(df, 1),
+            "extension_difference_deg": round(de, 1),
+            "asymmetry_flag":           df > 15 or de > 10,
+            "clinical_note": "Difference >15° flexion or >10° extension is clinically significant."
+        }
+
+    jp = os.path.join(folder, f"{pid}_knee_report.json")
+    with open(jp, 'w') as f:
+        json.dump({
+            "patient_id":  pid,
+            "test_date":   ts,
+            "standard":    "AAOS / AMA Guides 6th Edition — Knee ROM",
+            "left_knee":   asdict(left_r)  if left_r  else None,
+            "right_knee":  asdict(right_r) if right_r else None,
+            "bilateral_comparison": bilateral,
+            "normal_reference": {
+                "flexion_normal_deg":      THRESH['flexion_normal'],
+                "flexion_mild_flag_deg":   THRESH['flexion_mild'],
+                "flexion_moderate_deg":    THRESH['flexion_moderate'],
+                "flexion_severe_deg":      THRESH['flexion_severe'],
+                "extension_normal_deg":    0,
+                "extension_flag_deg":      THRESH['extension_flag'],
+                "extension_severe_deg":    THRESH['extension_severe'],
+                "ama_max_le_contribution_pct": 7.0,
+            }
+        }, f, indent=2)
+
+    # TXT
+    SEP = "=" * 64
+    tp  = os.path.join(folder, f"{pid}_knee_summary.txt")
+    with open(tp, 'w', encoding='utf-8') as f:
+        f.write(SEP + "\n  KNEE ROM ANALYSIS REPORT\n")
+        f.write("  Standard: AAOS / AMA Guides 6th Edition\n" + SEP + "\n")
+        f.write(f"  Patient ID  : {pid}\n  Test Date   : {ts}\n" + SEP + "\n\n")
+
+        for res, lbl in [(left_r,"LEFT KNEE"), (right_r,"RIGHT KNEE")]:
+            if not res:
+                continue
+            f.write(f"  {lbl}\n  " + "─"*44 + "\n")
+            f.write(f"  Neutral Baseline  : {res.neutral_angle:.1f}°"
+                    f"   (normal <= {THRESH['neutral_max']}°)\n")
+            f.write(f"  Max Flexion       : {res.max_flexion:.1f}°"
+                    f"   (normal >= {THRESH['flexion_normal']}°)"
+                    f"   Grade: {res.flexion_grade}"
+                    f"   Deficit: {res.flexion_deficit:.0f}°\n")
+            f.write(f"  Min Extension     : {res.min_extension:.1f}°"
+                    f"   (normal <= {THRESH['extension_flag']}°)"
+                    f"   Grade: {res.extension_grade}"
+                    f"   Deficit: {res.extension_deficit:.0f}°\n")
+            f.write(f"  Total Arc         : {res.total_arc:.1f}°"
+                    f"   (normal >= 120°)\n")
+            f.write(f"  AMA LE Impairment : {res.impairment_pct:.1f}%"
+                    f"   (normal < 1.5%)\n")
+            status = "NORMAL" if not res.abnormalities else "RESTRICTION DETECTED"
+            f.write(f"  Overall Status    : {status}\n")
+            if res.abnormalities:
+                f.write("\n  Abnormalities:\n")
+                for a in res.abnormalities:
+                    f.write(f"    - {a}\n")
+            f.write("\n  Clinical Notes:\n")
+            for n in res.clinical_notes:
+                f.write(f"    {n}\n")
+            f.write("\n")
+
+        if bilateral:
+            f.write("  BILATERAL COMPARISON\n  " + "─"*44 + "\n")
+            f.write(f"  Flexion  difference : {bilateral['flexion_difference_deg']:.1f}°"
+                    f"   {'FLAG: asymmetry > 15°' if bilateral['asymmetry_flag'] else 'within normal'}\n")
+            f.write(f"  Extension difference: {bilateral['extension_difference_deg']:.1f}°\n\n")
+
+        all_abn = []
+        if left_r  and left_r.abnormalities:  all_abn += left_r.abnormalities
+        if right_r and right_r.abnormalities: all_abn += right_r.abnormalities
+        f.write("  RECOMMENDATIONS\n  " + "─"*44 + "\n")
+        if not all_abn:
+            f.write("  - Knee ROM normal bilaterally.\n")
+            f.write("  - Continue current treatment plan.\n")
+            f.write("  - Routine ROM check every 3 months.\n")
+        else:
+            severe = any("SEVERE" in a for a in all_abn)
+            if severe:
+                f.write("  - URGENT: Refer to rheumatologist / orthopaedic specialist.\n")
+                f.write("  - Consider bracing for flexion contracture correction.\n")
+            f.write("  - Physiotherapy: knee mobilisation and strengthening.\n")
+            f.write("  - Exercises: flexion/extension 3-4x daily, 10-15 reps.\n")
+            f.write("  - Heat therapy before exercises recommended.\n")
+            f.write("  - Reassess ROM in 4-6 weeks.\n")
+
+        f.write("\n  AAOS / AMA REFERENCE\n  " + "─"*44 + "\n")
+        f.write(f"  Flexion   : 0° to {THRESH['flexion_normal']}°\n")
+        f.write(f"  Extension : return to 0°  (flag if > {THRESH['extension_flag']}°)\n")
+        f.write( "  Grades    : NORMAL / MILD / MODERATE / SEVERE\n")
+        f.write(SEP + "\n")
+
+    print(f"  📄 TXT  -> {tp}")
+    print(f"  📊 JSON -> {jp}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SINGLE LEG ANALYZER
+# ═══════════════════════════════════════════════════════════════
+
+class LegAnalyzer:
+    def __init__(self, cap, pose, side, pid, out):
+        self.cap      = cap
+        self.pose     = pose
+        self.side     = side
+        self.pid      = pid
+        self.out      = out
+        self.state    = TestState.NEUTRAL_BASELINE
+        self.max_flex = 0.0
+        self.min_ext  = 180.0
+        self.neutral  = 0.0
+        self.buf      = deque(maxlen=STAB['buf'])
+        self.hist     = []
+        self.hold_t   = None
+
+    def _stable(self, a: float) -> bool:
+        self.buf.append(a)
+        if len(self.buf) < STAB['buf']:
+            return False
+        return float(np.var(list(self.buf))) < STAB['variance']
+
+    def _plateaued(self, a: float) -> bool:
+        if self.state not in (TestState.FLEXION_TEST, TestState.EXTENSION_TEST):
+            return True
+        self.hist.append(a)
+        if len(self.hist) > STAB['plateau_win']:
+            self.hist.pop(0)
+        if len(self.hist) < STAB['plateau_win']:
+            return False
+        recent  = float(np.mean(self.hist[-5:]))
+        earlier = float(np.mean(self.hist[:5]))
+        return abs(recent - earlier) < STAB['plateau_tol']
+
+    def _capture_advance(self, frame, pose_lm, angle):
+        ann   = annotated_capture(frame, pose_lm, self.side,
+                                  angle, self.state, WINDOW_W, WINDOW_H)
+        fname = os.path.join(
+            self.out,
+            f"{self.pid}_{self.side}_{self.state.name}_{angle:.0f}deg.jpg"
+        )
+        cv2.imwrite(fname, ann)
+        print(f"  📸 {fname}")
+
+        if   self.state == TestState.NEUTRAL_BASELINE:
+            self.neutral = angle
+            self.state   = TestState.EXTENSION_TEST
+        elif self.state == TestState.EXTENSION_TEST:
+            self.state   = TestState.FLEXION_TEST
+        elif self.state == TestState.FLEXION_TEST:
+            self.state   = TestState.COMPLETE
+
+        self.hold_t = None
+        self.buf.clear()
+        self.hist.clear()
+
+    def _show_intro(self):
+        """2.5 second intro telling user which leg and camera position."""
+        deadline = time.time() + 2.5
+        while time.time() < deadline:
+            ret, raw = self.cap.read()
+            frame = cv2.resize(
+                cv2.flip(raw, 1) if ret else np.zeros((WINDOW_H,WINDOW_W,3), np.uint8),
+                (WINDOW_W, WINDOW_H)
+            )
+            ov = frame.copy()
+            cv2.rectangle(ov, (0,0),(WINDOW_W,WINDOW_H),(0,0,0),-1)
+            cv2.addWeighted(ov, 0.72, frame, 0.28, 0, frame)
+
+            bc = (155,48,0) if self.side=='left' else (0,68,155)
+            rrect(frame, WINDOW_W//2-220, WINDOW_H//2-70,
+                  WINDOW_W//2+220, WINDOW_H//2+70, 16, bc, alpha=0.92)
+            t(frame, f"Testing  {self.side.upper()}  KNEE",
+              WINDOW_W//2-190, WINDOW_H//2-15, 0.88, CW, 2, bold=True)
+            t(frame, f"Stand with {self.side.upper()} side toward camera",
+              WINDOW_W//2-215, WINDOW_H//2+30, 0.56, CW, 1)
+            t(frame, "Full body visible in frame",
+              WINDOW_W//2-155, WINDOW_H//2+58, 0.50, (180,180,180), 1)
+
+            cv2.imshow("Knee ROM Analyzer", frame)
+            if (cv2.waitKey(40) & 0xFF) == ord('q'):
+                return False
+        return True
+
+    def run(self) -> Optional[KneeResult]:
+        if not self._show_intro():
+            return None
+
+        while True:
+            ret, raw = self.cap.read()
+            if not ret:
+                break
+
+            raw   = cv2.flip(raw, 1)
+            frame = cv2.resize(raw, (WINDOW_W, WINDOW_H))
+            rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            res   = self.pose.process(rgb)
+
+            # COMPLETE → show report
+            if self.state == TestState.COMPLETE:
+                result   = analyze(self.neutral, self.max_flex, self.min_ext, self.side)
+                deadline = time.time() + REPORT_SECS
+                while time.time() < deadline:
+                    sl = deadline - time.time()
+                    cv2.imshow("Knee ROM Analyzer",
+                               draw_report_screen(result, sl))
+                    k = cv2.waitKey(40) & 0xFF
+                    if k == ord('q'):
+                        return result
+                return result
+
+            # ACTIVE TEST
+            if res.pose_landmarks:
+                hp, kp, ap, vis, *_ = get_leg(res.pose_landmarks, self.side)
+
+                if vis > 0.35:
+                    a = knee_angle(hp, kp, ap)
+
+                    if self.state == TestState.FLEXION_TEST:
+                        self.max_flex = max(self.max_flex, a)
+                    if self.state == TestState.EXTENSION_TEST:
+                        self.min_ext  = min(self.min_ext, a)
+
+                    ok, msg, hint = validate(a, self.state)
+                    stable    = self._stable(a)
+                    plateaued = self._plateaued(a)
+                    ready     = ok and stable and plateaued
+
+                    countdown = None
+                    if ready:
+                        if self.hold_t is None:
+                            self.hold_t = time.time()
+                        remaining = STAB['hold_sec'] - (time.time() - self.hold_t)
+                        countdown = max(0.0, remaining)
+                        if remaining <= 0:
+                            self._capture_advance(frame.copy(), res.pose_landmarks, a)
+                            continue
+                    else:
+                        self.hold_t = None
+
+                    frame = draw_live(
+                        frame, res.pose_landmarks, a, self.state, self.side,
+                        ok, msg, hint, self.max_flex, self.min_ext,
+                        countdown, stable, WINDOW_W, WINDOW_H
+                    )
+                else:
+                    rrect(frame, 8, WINDOW_H-68, 560, WINDOW_H-8, 6, (52,0,0), 0.8)
+                    t(frame, "Low visibility — step back / improve lighting",
+                      18, WINDOW_H-30, 0.56, CR, 2)
+            else:
+                rrect(frame, 8, WINDOW_H-68, 580, WINDOW_H-8, 6, (52,0,0), 0.8)
+                t(frame, "Body not detected — ensure full leg is visible",
+                  18, WINDOW_H-30, 0.56, CR, 2)
+
+            cv2.imshow("Knee ROM Analyzer", frame)
+            k = cv2.waitKey(10) & 0xFF
+            if k == ord('q'):
+                return None
+            elif k == ord('r'):
+                self.state    = TestState.NEUTRAL_BASELINE
+                self.max_flex = 0.0
+                self.min_ext  = 180.0
+                self.buf.clear()
+                self.hist.clear()
+                self.hold_t = None
+
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════
+
+def main():
+    print("\n" + "═"*54)
+    print("  KNEE ROM ANALYZER")
+    print("  Rheumatoid Arthritis Detection")
+    print("  Standard: AAOS / AMA Guides 6th Edition")
+    print("═"*54)
+    print("\n  IMPORTANT: Patient must stand SIDE-PROFILE to camera")
+    print("  Left test  → left side toward camera")
+    print("  Right test → right side toward camera")
+    print("═"*54)
+
+    pid = input("\n  Patient ID (e.g. P001): ").strip()
+    if not pid:
+        print("  Patient ID required.")
+        return
+
+    cam = select_camera()
+    out = os.path.join("knee_output", pid)
+    os.makedirs(out, exist_ok=True)
+
+    print("\n  Connecting to camera...")
+    cap = cv2.VideoCapture(cam)
+    if not cap.isOpened():
+        print(f"  Cannot open camera: {cam}")
+        return
+    ret, _ = cap.read()
+    if not ret:
+        print("  Camera open but no frames.")
+        cap.release()
+        return
+    print("  Camera ready\n")
+
+    pose = mp.solutions.pose.Pose(
+        static_image_mode=False, model_complexity=1,
+        min_detection_confidence=0.65, min_tracking_confidence=0.65
+    )
+
+    cv2.namedWindow("Knee ROM Analyzer", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Knee ROM Analyzer", WINDOW_W, WINDOW_H)
+
+    # LEFT LEG
+    print("  Starting LEFT knee test (automatic)...")
+    left_r = LegAnalyzer(cap, pose, 'left', pid+"_L", out).run()
+
+    # TRANSITION + RIGHT LEG
+    right_r = None
+    if left_r is not None:
+        if draw_transition(cap, INTER_LEG_SEC):
+            print("  Starting RIGHT knee test (automatic)...")
+            right_r = LegAnalyzer(cap, pose, 'right', pid+"_R", out).run()
+
+    # SAVE COMBINED REPORT
+    if left_r or right_r:
+        print("\n  Saving combined report...")
+        save_report(out, pid, left_r, right_r)
+        print(f"  All files: knee_output/{pid}/")
+
+    cap.release()
+    cv2.destroyAllWindows()
+    print("  Done.\n")
+
+
+if __name__ == "__main__":
+    main()
