@@ -176,9 +176,9 @@ Meet the amazing team behind Arthocare:
         <sub><b>Heer Lohana</b></sub>
       </a>
       <br />
-      <a href="https://linkedin.com/in/heerharish">LinkedIn</a> •
+      <a href="https://www.linkedin.com/in/heer-harish/">LinkedIn</a> •
       <a href="https://github.com/HEERHARISH1">GitHub</a> •
-      <a href="mailto:heer.harish04@gmail.com">Email</a>
+      <a href="mailto:heerlohana1761@gmail.com">Email</a>
       <br />
       <sub>AI/ML Engineer • Backend Developer</sub>
       <br />
@@ -252,7 +252,7 @@ We would like to express our gratitude to:
 
 | Name |  Email | LinkedIn | Phone |
 |---|---|---|---|
-| Heer Lohana  | heer.harish04@gmail.com | [LinkedIn](https://linkedin.com/in/heerharish) | +92 303 9049119 |
+| Heer Lohana  | heerlohana1761@gmail.com | [LinkedIn](https://www.linkedin.com/in/heer-harish/) | +92 303 9049119 |
 | Umema Ashar =| umema2004@gmail.com | [LinkedIn](https://www.linkedin.com/in/umema-ashar-2004ua) | +92 300 8420208 |
 | Hamza Asad  | hamza26asad@gmail.com | [LinkedIn](https://www.linkedin.com/in/hamza-asad-6bb307253/) | +92 333 4365190 |
 
