@@ -180,7 +180,7 @@ Meet the amazing team behind Arthocare:
       <a href="https://github.com/HEERHARISH1">GitHub</a> •
       <a href="mailto:heerlohana1761@gmail.com">Email</a>
       <br />
-      <sub>AI/ML Engineer • Backend Developer</sub>
+      <sub>AI/ML Engineer • Backend Developer • App developer  </sub>
       <br />
       <sub>📞 +92 303 9049119</sub>
     </td>
@@ -194,7 +194,7 @@ Meet the amazing team behind Arthocare:
       <a href="https://www.linkedin.com/in/umema-ashar-2004ua">LinkedIn</a> •
       <a href="mailto:umema2004@gmail.com">Email</a>
       <br />
-      <sub>Frontend Developer • UI/UX Designer</sub>
+      <sub>AI/ML Engineer • Backend Developer • App developer</sub>
       <br />
       <sub>📞 +92 300 8420208</sub>
     </td>
@@ -208,7 +208,7 @@ Meet the amazing team behind Arthocare:
       <a href="https://www.linkedin.com/in/hamza-asad-6bb307253/">LinkedIn</a> •
       <a href="mailto:hamza26asad@gmail.com">Email</a>
       <br />
-      <sub>Full-Stack Developer • Database Engineer</sub>
+      <sub>AI/ML Engineer • Backend Developer • App developer</sub>
       <br />
       <sub>📞 +92 333 4365190</sub>
     </td>
