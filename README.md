@@ -252,9 +252,9 @@ We would like to express our gratitude to:
 
 | Name |  Email | LinkedIn | Phone |
 |---|---|---|---|
-| Heer Lohana  | heerlohana1761@gmail.com | [LinkedIn](https://www.linkedin.com/in/heer-harish/) | +92 303 9049119 |
-| Umema Ashar =| umema2004@gmail.com | [LinkedIn](https://www.linkedin.com/in/umema-ashar-2004ua) | +92 300 8420208 |
-| Hamza Asad  | hamza26asad@gmail.com | [LinkedIn](https://www.linkedin.com/in/hamza-asad-6bb307253/) | +92 333 4365190 |
+| Heer Lohana  | heerlohana1761@gmail.com | [LinkedIn](https://www.linkedin.com/in/heer-harish/) 
+| Umema Ashar =| umema2004@gmail.com | [LinkedIn](https://www.linkedin.com/in/umema-ashar-2004ua) 
+| Hamza Asad  | hamza26asad@gmail.com | [LinkedIn](https://www.linkedin.com/in/hamza-asad-6bb307253/) 
 
 
 ---
